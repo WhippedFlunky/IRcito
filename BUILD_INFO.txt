@@ -1,0 +1,10 @@
+IR Learner StickS3 v1.4 saved remotes + TV-B-Gone
+PlatformIO build: SUCCESS (m5stack-sticks3), Arduino-ESP32 3.3.6 / ESP-IDF 5.5.2
+Application image: IR-Learner-StickS3-v1.4-saved-remotes-tvbgone-app.bin
+Size: 653744 bytes
+SHA-256: 66dbff9ba4df2809cef1fa3f9a85c29e093b5a1b884cc769bea8cc0d9d324b71
+Image: ESP32-S3 application, not a merged image for offset 0x0. EasyLauncher app partition only.
+Partition CSV is unchanged. Actual running EasyLauncher NVS partition is inspected at boot.
+IR pipeline header SHA-256 (unchanged from v1.3): 65a97ce85edb568bd26d30c7f1588d2e6fe680b02e11b6cb3991d0addae47770
+Host tests: pipeline PASS, transactional storage PASS, TV-B-Gone 137 NA + 137 EU codes PASS.
+Physical acceptance of retention/TV response remains pending on StickS3.

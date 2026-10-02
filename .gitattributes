@@ -1,0 +1,2 @@
+# Vendored TV-B-Gone database: preserve upstream formatting.
+third_party/tvbgone/WORLD_IR_CODES.h -whitespace
