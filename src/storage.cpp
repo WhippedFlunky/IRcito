@@ -130,6 +130,17 @@ bool begin() {
   return true;
 }
 bool available() { return ready; }
+bool validName(const char *name, size_t capacity) {
+  if (!name || capacity == 0 || capacity > 20) return false;
+  size_t length = 0;
+  for (; length < capacity && name[length]; ++length) {
+    const char c = name[length];
+    if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+          (c >= '0' && c <= '9') || c == ' ' || c == '-' || c == '_' || c == '+'))
+      return false;
+  }
+  return length > 0 && length < capacity;
+}
 bool loadRemote(uint8_t remote, Remote &record) {
   if (remote >= kRemotes) return false;
   record.id = remote + 1;
@@ -152,7 +163,7 @@ bool loadRemote(uint8_t remote, Remote &record) {
 }
 bool saveRemote(uint8_t remote, const Remote &record) {
   if (!ready || remote >= kRemotes || record.id != uint32_t(remote + 1) ||
-      !std::memchr(record.name, 0, sizeof(record.name))) return false;
+      !validName(record.name)) return false;
   RemoteWire h = {};
   h.magic = kMagic; h.version = kVersion; h.bytes = sizeof(h); h.id = record.id;
   std::memcpy(h.name, record.name, sizeof(h.name));
@@ -161,6 +172,9 @@ bool saveRemote(uint8_t remote, const Remote &record) {
   return prefs.putBytes(name, &h, sizeof(h)) == sizeof(h);
 }
 bool loadSignal(uint8_t remote, uint8_t button, Signal &signal) { return read(remote, button, signal, false); }
+bool loadSignalForExport(uint8_t remote, uint8_t button, Signal &signal) {
+  return read(remote, button, signal, true);
+}
 bool saveSignal(uint8_t remote, uint8_t button, const Signal &signal) {
   if (!ready || !validSlot(remote, button) || signal.rawCount > kMaxRaw) return false;
   const uint8_t protocol = signal.decoded.valid ? uint8_t(signal.decoded.protocol) : 0;
@@ -187,7 +201,10 @@ bool saveSignal(uint8_t remote, uint8_t button, const Signal &signal) {
   h.repeats = signal.repeatCount;
   h.period = signal.repeatPeriodUs;
   h.rawCount = rawCount;
-  std::snprintf(h.name, sizeof(h.name), "Button %u", button + 1);
+  if (signal.name[0]) {
+    if (!validName(signal.name)) { Serial.println("[STORE] invalid signal name"); return false; }
+    std::memcpy(h.name, signal.name, sizeof(h.name));
+  } else std::snprintf(h.name, sizeof(h.name), "Button %u", button + 1);
   if (!validHeader(h, h.bytes, remote, button)) {
     Serial.println("[STORE] refused invalid signal metadata"); return false;
   }

@@ -6,9 +6,14 @@
 #include <driver/rmt_tx.h>
 #include <esp_err.h>
 #include <esp_heap_caps.h>
+#include <cstring>
 #include "ir_pipeline.h"
 #include "storage.h"
 #include "tvbgone.h"
+#include "macros.h"
+#include "hold_policy.h"
+#include "backup.h"
+#include "text_editor.h"
 
 namespace {
 constexpr gpio_num_t kRxPin = GPIO_NUM_42;
@@ -47,19 +52,38 @@ uint32_t rawBPressedAt = 0;
 bool capturedAPending = false;
 uint32_t capturedAPressedAt = 0;
 uint8_t selectedRemote = 0, selectedButton = 0;
+uint8_t selectedMacro = 0, selectedStep = 0, editRemote = 0, editButton = 0, editDelay = 0;
+constexpr uint16_t kDelays[] = {0,250,500,1000,2000};
+macros::Macro activeMacro;
+editor::State nameEditor;
+enum class RenameTarget { Remote, Button, Macro } renameTarget;
+bool renameAPending = false, renameBPending = false;
+uint32_t renameAAt = 0, renameBAt = 0;
+backup::Importer importer;
+uint32_t importLastAt = 0;
+bool macroRunning = false;
+uint8_t macroStep = 0;
+uint32_t macroNextAt = 0;
+bool savedAPending = false, holdActive = false;
+uint32_t holdNextUs = 0;
+uint32_t holdAdditional = 0;
+hold::Policy holdPolicy;
 tvbgone::Region tvRegion = tvbgone::Region::NorthAmerica;
 size_t tvPosition = 0;
 uint32_t tvNextAt = 0;
 bool tvRunning = false;
 const char *saveMessage = "";
-constexpr const char *kHomeItems[] = {"Learn", "Remotes", "TV-B-Gone", "Settings", "About"};
-constexpr const char *kSavedItems[] = {"Test", "Delete", "Back"};
+constexpr const char *kHomeItems[] = {"Learn", "Remotes", "Macros", "TV-B-Gone", "Settings", "About"};
+constexpr const char *kSavedItems[] = {"Test", "Rename", "Delete", "Back"};
 
 enum class Page { Home, About, Waiting, Captured, Remotes, Buttons, SavedButton,
                   SaveRemote, SaveButton, Overwrite, SaveResult, Settings,
-                  EraseConfirm, TvMenu, TvSending, Error };
+                  EraseConfirm, TvMenu, TvSending, Error, RemoteActions,
+                  MacroList, MacroMenu, MacroEdit, MacroStep, MacroRunning,
+                  Rename, Import };
 Page page = Page::Home;
 Page resultBack = Page::Captured;
+Page renameBack = Page::Home;
 int selection = 0;
 
 bool check(esp_err_t result, const char *operation) {
@@ -81,7 +105,7 @@ void render() {
   switch (page) {
     case Page::Home:
       heading("IR Learner");
-      for (int i = 0; i < 5; ++i)
+      for (int i = 0; i < 6; ++i)
         M5.Display.printf("%c %s\n", selection == i ? '>' : ' ',
                           kHomeItems[i]);
       M5.Display.print("B: next  A: enter");
@@ -126,22 +150,79 @@ void render() {
       heading(page == Page::Buttons ? "Remote buttons" : "Save / Button");
       for (uint8_t i = 0; i < store::kButtons; ++i) {
         const bool occupied = store::loadSignal(selectedRemote, i, slotScratch);
-        M5.Display.printf("%c Button %u %s\n", selection == i ? '>' : ' ', i + 1,
-                          occupied ? "[saved]" : "[empty]");
+        M5.Display.printf("%c %s %s\n", selection == i ? '>' : ' ',
+                          occupied ? slotScratch.name : "[empty]",
+                          occupied ? "" : "");
       }
       M5.Display.printf("%c Back\nB: next  A: enter", selection == 4 ? '>' : ' ');
       break;
     case Page::SavedButton:
       heading("Saved button");
-      M5.Display.printf("Remote %u / Button %u\n%s  %lu kHz\n", selectedRemote + 1,
-                        selectedButton + 1,
+      M5.Display.printf("%s\n%s  %lu kHz\n", activeSignal.name,
                         !activeSignal.decoded.valid ? "RAW" :
                           activeSignal.decoded.protocol == ir::Protocol::SonySIRC12 ? "Sony SIRC12" : "NEC",
                         static_cast<unsigned long>(activeSignal.carrierHz / 1000));
-      for (int i = 0; i < 3; ++i)
+      for (int i = 0; i < 4; ++i)
         M5.Display.printf("%c %s\n", selection == i ? '>' : ' ',
                           kSavedItems[i]);
+      M5.Display.print("B: next A: enter/Hold");
+      break;
+    case Page::RemoteActions: {
+      store::Remote remote;
+      store::loadRemote(selectedRemote,remote);
+      heading(remote.name);
+      constexpr const char *items[]={"Buttons","Rename","Back"};
+      for (int i=0;i<3;++i) M5.Display.printf("%c %s\n",selection==i?'>':' ',items[i]);
       M5.Display.print("B: next  A: enter");
+      break;
+    }
+    case Page::MacroList:
+      heading("Macros");
+      for (uint8_t i=0;i<macros::kSlots;++i) {
+        macros::Macro m;macros::load(i,m);
+        M5.Display.printf("%c %s\n",selection==i?'>':' ',m.name);
+      }
+      M5.Display.printf("%c Back\nB: next A: enter",selection==4?'>':' ');
+      break;
+    case Page::MacroMenu: {
+      heading(activeMacro.name);
+      M5.Display.printf("%u steps\n",activeMacro.stepCount);
+      constexpr const char *items[]={"Run","Edit","Rename","Delete","Back"};
+      for (int i=0;i<5;++i) M5.Display.printf("%c %s\n",selection==i?'>':' ',items[i]);
+      break;
+    }
+    case Page::MacroEdit:
+      heading("Macro steps");
+      for (int i=selection>2?selection-2:0;
+           i<=activeMacro.stepCount+(activeMacro.stepCount<macros::kMaxSteps?1:0) &&
+           i<(selection>2?selection-2:0)+5;++i) {
+        if (i==activeMacro.stepCount && activeMacro.stepCount<macros::kMaxSteps)
+          M5.Display.printf("%c Add step\n",selection==i?'>':' ');
+        else if (i==activeMacro.stepCount+(activeMacro.stepCount<macros::kMaxSteps?1:0))
+          M5.Display.printf("%c Back\n",selection==i?'>':' ');
+        else M5.Display.printf("%c %u: R%u B%u +%u\n",selection==i?'>':' ',i+1,
+          activeMacro.steps[i].remote+1,activeMacro.steps[i].button+1,
+          activeMacro.steps[i].delayAfterMs);
+      }
+      break;
+    case Page::MacroStep:
+      heading("Edit step");
+      M5.Display.printf("%c Remote %u\n%c Button %u\n%c Delay %u ms\n%c Save\n%c Delete/Back\nB: next A: change",
+        selection==0?'>':' ',editRemote+1,selection==1?'>':' ',editButton+1,
+        selection==2?'>':' ',kDelays[editDelay],selection==3?'>':' ',selection==4?'>':' ');
+      break;
+    case Page::MacroRunning:
+      heading("Macro running");
+      M5.Display.printf("%s\nStep %u / %u\n\nB: Cancel",activeMacro.name,
+        unsigned(macroStep+1),unsigned(activeMacro.stepCount));
+      break;
+    case Page::Rename:
+      heading("Rename");
+      M5.Display.printf("%s%c\nCharacter: %c\nA: add B: next char\nHold A: save\nHold B: cancel",nameEditor.text,'_',nameEditor.current());
+      break;
+    case Page::Import:
+      heading("Import Backup");
+      M5.Display.printf("Paste Serial backup\n115200 baud\nImported %u Errors %u\nB: cancel",importer.imported(),importer.errors());
       break;
     case Page::Overwrite:
     case Page::EraseConfirm:
@@ -156,8 +237,9 @@ void render() {
       break;
     case Page::Settings:
       heading("Settings");
-      M5.Display.printf("%c Erase all learned\n%c Back\n\nB: next  A: enter",
-                        selection == 0 ? '>' : ' ', selection == 1 ? '>' : ' ');
+      M5.Display.printf("%c Export Backup\n%c Import Backup\n%c Erase all learned\n%c Back\nB: next A: enter",
+                        selection == 0 ? '>' : ' ', selection == 1 ? '>' : ' ',
+                        selection == 2 ? '>' : ' ', selection == 3 ? '>' : ' ');
       break;
     case Page::TvMenu:
       heading("TV-B-Gone");
@@ -325,6 +407,7 @@ void handleRx() {
   // Capture metadata for persistence; the RX and prepared RAW TX arrays above
   // remain untouched. A saved signal follows this same replay path.
   activeSignal.id = 0;
+  activeSignal.name[0] = 0;
   activeSignal.decoded = decoded;
   activeSignal.rawCount = frameCount;
   memcpy(activeSignal.raw, rxSymbols, frameCount * sizeof(rmt_symbol_word_t));
@@ -346,7 +429,7 @@ bool setTxCarrier(uint32_t hz) {
   return true;
 }
 
-void replay(const store::Signal &signal) {
+void replay(const store::Signal &signal, bool sonySingle = false) {
   if (!hardwareReady && !initIr()) { page = Page::Error; render(); return; }
   if (!hardwareReady || !txChannel || !encoder ||
       (!signal.decoded.valid && signal.rawCount == 0) || signal.rawCount > kCapacity) {
@@ -412,18 +495,65 @@ void replay(const store::Signal &signal) {
   Serial.printf("[TX] Sony SIRC12 command=%lu address=%lu\n",
                 static_cast<unsigned long>(signal.decoded.command),
                 static_cast<unsigned long>(signal.decoded.address));
-  for (unsigned frame = 0; frame < 3; ++frame) {
-    Serial.printf("[TX] Sony frame %u/3\n", frame + 1);
+  const unsigned frames = sonySingle ? 1 : 3;
+  for (unsigned frame = 0; frame < frames; ++frame) {
+    Serial.printf("[TX] Sony frame %u/%u\n", frame + 1, frames);
     const uint32_t frameStartUs = micros();
     if (!check(rmt_transmit(txChannel, encoder, sony, sizeof(sony), &config), "rmt_transmit")) return;
     if (!check(rmt_tx_wait_all_done(txChannel, 1000), "rmt_tx_wait_all_done")) return;
-    if (frame < 2) {
+    if (frame + 1 < frames) {
       const uint32_t elapsedUs = micros() - frameStartUs;
       if (elapsedUs < 45000) delayMicroseconds(45000 - elapsedUs);
       else Serial.printf("[TX] Sony frame overran 45 ms period: %lu us\n", static_cast<unsigned long>(elapsedUs));
     }
   }
   Serial.println("[TX] Sony SIRC12 replay complete");
+}
+
+bool sendNecRepeat() {
+  if (!setTxCarrier(kRawCarrierHz)) return false;
+  rmt_symbol_word_t repeat[2] = {};
+  repeat[0].level0=1; repeat[0].duration0=9000;
+  repeat[0].level1=0; repeat[0].duration1=2250;
+  repeat[1].level0=1; repeat[1].duration0=560;
+  repeat[1].level1=0; repeat[1].duration1=560;
+  rmt_transmit_config_t config = {};
+  config.flags.eot_level=0;
+  return check(rmt_transmit(txChannel,encoder,repeat,sizeof(repeat),&config),"rmt_transmit NEC repeat") &&
+         check(rmt_tx_wait_all_done(txChannel,1000),"rmt_tx_wait_all_done NEC repeat");
+}
+
+void serviceHold() {
+  if (page!=Page::SavedButton || selection!=0 || !savedAPending) return;
+  if (M5.BtnA.wasReleased()) {
+    if (holdActive) Serial.println("[HOLD] stop");
+    savedAPending=holdActive=false;return;
+  }
+  if (!M5.BtnA.isPressed()) return;
+  if (holdPolicy.mode==hold::Mode::None) {
+    savedAPending=false;
+    Serial.println("[HOLD] repeat unavailable for this signal");return;
+  }
+  if (int32_t(micros()-holdNextUs)<0) return;
+  if (!holdActive) {
+    holdActive=true;holdAdditional=0;
+    Serial.printf("[HOLD] start protocol=%s\n",
+      holdPolicy.mode==hold::Mode::SonyFrame?"Sony SIRC12":
+      holdPolicy.mode==hold::Mode::NecRepeat?"NEC":"RAW");
+  }
+  const uint32_t frameStart=micros();
+  bool okay=true;
+  if (holdPolicy.mode==hold::Mode::SonyFrame) replay(activeSignal,true);
+  else if (holdPolicy.mode==hold::Mode::NecRepeat) okay=sendNecRepeat();
+  else replay(activeSignal);
+  if (!okay) {savedAPending=holdActive=false;return;}
+  Serial.printf("[HOLD] repeat %u\n",++holdAdditional);
+  if (holdPolicy.maxAdditional && holdAdditional>=holdPolicy.maxAdditional) {
+    savedAPending=holdActive=false;Serial.println("[HOLD] configured RAW repeats complete");return;
+  }
+  holdNextUs=frameStart+holdPolicy.periodUs;
+  if (int32_t(micros()-holdNextUs)>=0)
+    holdNextUs=micros()+holdPolicy.periodUs;
 }
 
 void prepareSavedTx(const store::Signal &signal) {
@@ -475,6 +605,113 @@ void saveSelectedSlot() {
   page = Page::SaveResult;
   render();
 }
+
+void startRename(RenameTarget target, Page back) {
+  renameTarget=target;renameBack=back;
+  nameEditor.start(""); // New name is composed from scratch; cancellation leaves NVS intact.
+  renameAPending=renameBPending=false;
+  page=Page::Rename;render();
+}
+
+void commitRename() {
+  if (!store::validName(nameEditor.text)) {Serial.println("[NAME] empty/invalid name");return;}
+  bool ok=false;
+  if (renameTarget==RenameTarget::Remote) {
+    store::Remote remote;
+    store::loadRemote(selectedRemote,remote);
+    std::memcpy(remote.name,nameEditor.text,sizeof(remote.name));
+    ok=store::saveRemote(selectedRemote,remote);
+  } else if (renameTarget==RenameTarget::Button) {
+    store::Signal previous;
+    if (store::loadSignal(selectedRemote,selectedButton,previous)) {
+      std::memcpy(previous.name,nameEditor.text,sizeof(previous.name));
+      ok=store::saveSignal(selectedRemote,selectedButton,previous);
+      if (ok) activeSignal=previous;
+    }
+  } else {
+    macros::Macro candidate=activeMacro;
+    std::memcpy(candidate.name,nameEditor.text,sizeof(candidate.name));
+    ok=macros::save(selectedMacro,candidate);
+    if (ok) activeMacro=candidate;
+  }
+  Serial.printf("[NAME] %s\n",ok?"saved":"save failed; previous name retained");
+  if (ok) {page=renameBack;selection=0;render();}
+}
+
+void serviceRename() {
+  if (M5.BtnA.wasPressed()) {renameAAt=millis();renameAPending=true;}
+  if (M5.BtnB.wasPressed()) {renameBAt=millis();renameBPending=true;}
+  if (renameAPending && M5.BtnA.isPressed() && millis()-renameAAt>=800) {
+    renameAPending=false;commitRename();
+  } else if (renameAPending && M5.BtnA.wasReleased()) {
+    renameAPending=false;nameEditor.accept();render();
+  }
+  if (page!=Page::Rename) return;
+  if (renameBPending && M5.BtnB.isPressed() && millis()-renameBAt>=800) {
+    renameBPending=false;page=renameBack;selection=0;render();
+  } else if (renameBPending && M5.BtnB.wasReleased()) {
+    renameBPending=false;nameEditor.next();render();
+  }
+}
+
+void startMacro() {
+  if (!activeMacro.stepCount) {Serial.println("[MACRO] empty");return;}
+  macroStep=0;macroNextAt=millis();macroRunning=true;
+  page=Page::MacroRunning;Serial.printf("[MACRO] start %s\n",activeMacro.name);render();
+}
+void serviceMacro() {
+  if (M5.BtnB.wasPressed()) {
+    Serial.println("[MACRO] cancelled");macroRunning=false;
+    page=Page::MacroMenu;selection=0;render();return;
+  }
+  if (!macroRunning || int32_t(millis()-macroNextAt)<0) return;
+  if (macroStep>=activeMacro.stepCount) {
+    Serial.println("[MACRO] complete");macroRunning=false;
+    page=Page::MacroMenu;selection=0;render();return;
+  }
+  const auto &step=activeMacro.steps[macroStep];
+  if (!store::loadSignal(step.remote,step.button,activeSignal)) {
+    Serial.printf("[MACRO] missing Remote %u / Button %u\n",step.remote+1,step.button+1);
+    macroRunning=false;saveMessage="Missing macro button; see Serial";
+    resultBack=Page::MacroMenu;page=Page::SaveResult;render();return;
+  }
+  prepareSavedTx(activeSignal);
+  Serial.printf("[MACRO] step %u/%u R%u B%u delay=%u ms\n",macroStep+1,
+    activeMacro.stepCount,step.remote+1,step.button+1,step.delayAfterMs);
+  replay(activeSignal); // Same known-good replay path as SavedButton/Test.
+  macroNextAt=millis()+step.delayAfterMs;
+  ++macroStep;render();
+}
+
+void serialLine(const char *line, void *) {Serial.println(line);}
+void exportBackup() {
+  Serial.println("[EXPORT] BEGIN");
+  const bool okay=backup::exportAll(serialLine,nullptr);
+  Serial.println("[EXPORT] END");
+  saveMessage=okay?"Exported on USB Serial":"Export failed; see Serial";
+  resultBack=Page::Settings;page=Page::SaveResult;render();
+}
+
+void serviceImport() {
+  if (M5.BtnB.wasPressed()) {
+    Serial.printf("[IMPORT] cancelled; committed=%u errors=%u\n",importer.imported(),importer.errors());
+    page=Page::Settings;selection=0;render();return;
+  }
+  while (Serial.available()) {
+    importLastAt=millis();
+    if (!importer.feed(char(Serial.read())))
+      Serial.printf("[IMPORT] rejected record; errors=%u\n",importer.errors());
+    if (importer.complete()) {
+      Serial.printf("[IMPORT] complete records=%u errors=%u\n",importer.imported(),importer.errors());
+      saveMessage=importer.errors()?"Imported with errors; see Serial":"Import complete";
+      resultBack=Page::Settings;page=Page::SaveResult;render();return;
+    }
+  }
+  if (millis()-importLastAt>30000) {
+    Serial.printf("[IMPORT] timeout; partial records=%u errors=%u\n",importer.imported(),importer.errors());
+    importLastAt=millis();
+  }
+}
 } // namespace
 
 void setup() {
@@ -485,7 +722,7 @@ void setup() {
   M5.Speaker.end();
   Serial.begin(115200);
   delay(250);
-  Serial.println("[BOOT] IR Learner StickS3 v1.4 saved remotes + TV-B-Gone");
+  Serial.println("[BOOT] IR Learner StickS3 v1.5 utilities");
   M5.Display.setRotation(3);
   M5.Display.setTextSize(1);
   M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
@@ -495,23 +732,25 @@ void setup() {
                 static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)));
   Serial.println("[BOOT] Display initialized, speaker disabled");
   store::begin();
+  macros::begin();
   render();
 }
 
 void loop() {
   M5.update();
   handleRx();
+  serviceHold();
   if (page == Page::Waiting && rxArmed && millis() - waitingSince > kWaitTimeoutMs) {
     Serial.printf("[RX] Timeout after %lu ms; still waiting for signal\n", static_cast<unsigned long>(kWaitTimeoutMs));
     waitingSince = millis();
   }
   if (page == Page::Home) {
-    if (M5.BtnB.wasPressed()) { selection = (selection + 1) % 5; render(); }
+    if (M5.BtnB.wasPressed()) { selection = (selection + 1) % 6; render(); }
     if (M5.BtnA.wasPressed()) {
       if (selection == 0) learn();
       else {
-        page = selection == 1 ? Page::Remotes : selection == 2 ? Page::TvMenu :
-               selection == 3 ? Page::Settings : Page::About;
+        page = selection == 1 ? Page::Remotes : selection == 2 ? Page::MacroList :
+               selection == 3 ? Page::TvMenu : selection == 4 ? Page::Settings : Page::About;
         selection = 0;
         render();
       }
@@ -564,6 +803,12 @@ void loop() {
       Serial.println("[TVBGONE] cancelled");
       tvRunning = false; page = Page::TvMenu; selection = 0; render();
     } else sendNextTvCode();
+  } else if (page == Page::MacroRunning) {
+    serviceMacro();
+  } else if (page == Page::Rename) {
+    serviceRename();
+  } else if (page == Page::Import) {
+    serviceImport();
   } else if (page == Page::About || page == Page::Error) {
     if (M5.BtnA.wasPressed() || M5.BtnB.wasPressed()) {
       page = Page::Home; selection = 0; render();
@@ -573,9 +818,11 @@ void loop() {
       page = resultBack; selection = 0; render();
     }
   } else {
-    const int options = page == Page::Settings || page == Page::Overwrite ||
-                        page == Page::EraseConfirm ? 2 :
-                        page == Page::SavedButton || page == Page::TvMenu ? 3 : 5;
+    const int options = page == Page::Overwrite || page == Page::EraseConfirm ? 2 :
+                        page == Page::RemoteActions || page == Page::TvMenu ? 3 :
+                        page == Page::Settings || page == Page::SavedButton ? 4 :
+                        page == Page::MacroEdit ? activeMacro.stepCount+1+
+                                               (activeMacro.stepCount<macros::kMaxSteps?1:0) : 5;
     if (M5.BtnB.wasPressed()) { selection = (selection + 1) % options; render(); }
     if (M5.BtnA.wasPressed()) {
       switch (page) {
@@ -586,12 +833,17 @@ void loop() {
             selection = 0;
           } else {
             selectedRemote = selection;
-            page = page == Page::Remotes ? Page::Buttons : Page::SaveButton;
+            page = page == Page::Remotes ? Page::RemoteActions : Page::SaveButton;
             selection = 0;
           }
           break;
+        case Page::RemoteActions:
+          if (selection==0) {page=Page::Buttons;selection=0;}
+          else if (selection==1) startRename(RenameTarget::Remote,Page::RemoteActions);
+          else {page=Page::Remotes;selection=0;}
+          break;
         case Page::Buttons:
-          if (selection == 4) { page = Page::Remotes; selection = 0; }
+          if (selection == 4) { page = Page::RemoteActions; selection = 0; }
           else {
             selectedButton = selection;
             if (store::loadSignal(selectedRemote, selectedButton, activeSignal)) {
@@ -615,16 +867,31 @@ void loop() {
           else { page = Page::SaveButton; selection = 0; }
           break;
         case Page::SavedButton:
-          if (selection == 0) replay(activeSignal);
-          else if (selection == 1) {
+          if (selection == 0) {
+            // Initial known-good press remains unchanged; hold is armed after it.
+            holdPolicy=hold::forSignal(activeSignal);
+            const uint32_t firstStartUs=micros();
+            replay(activeSignal);
+            savedAPending=true;holdActive=false;
+            // Sony's normal Test sent three frames at 0/45/90 ms. The next
+            // held frame starts at ~135 ms; NEC repeat begins at ~110 ms.
+            holdNextUs=firstStartUs+hold::firstRepeatOffsetUs(holdPolicy);
+          } else if (selection == 1) startRename(RenameTarget::Button,Page::SavedButton);
+          else if (selection == 2) {
             if (store::deleteSignal(selectedRemote, selectedButton)) {
               page = Page::Buttons; selection = 0;
             }
           } else { page = Page::Buttons; selection = 0; }
           break;
         case Page::Settings:
-          if (selection == 0) { page = Page::EraseConfirm; selection = 1; }
-          else { page = Page::Home; selection = 0; }
+          if (selection==0) exportBackup();
+          else if (selection==1) {
+            importer.reset();
+            while (Serial.available()) Serial.read(); // Flush prior serial log/commands.
+            importLastAt=millis();page=Page::Import;selection=0;
+            Serial.println("[IMPORT] BEGIN; send IRCITO-BACKUP|1 through END as lines");
+          } else if (selection==2) {page=Page::EraseConfirm;selection=1;}
+          else {page=Page::Home;selection=0;}
           break;
         case Page::EraseConfirm:
           if (selection == 0) {
@@ -644,6 +911,66 @@ void loop() {
             tvRegion = tvRegion == tvbgone::Region::NorthAmerica ?
                        tvbgone::Region::Europe : tvbgone::Region::NorthAmerica;
           } else { page = Page::Home; selection = 0; }
+          break;
+        case Page::MacroList:
+          if (selection==4) {page=Page::Home;selection=0;}
+          else {
+            selectedMacro=uint8_t(selection);
+            macros::load(selectedMacro,activeMacro);
+            page=Page::MacroMenu;selection=0;
+          }
+          break;
+        case Page::MacroMenu:
+          if (selection==0) startMacro();
+          else if (selection==1) {page=Page::MacroEdit;selection=0;}
+          else if (selection==2) startRename(RenameTarget::Macro,Page::MacroMenu);
+          else if (selection==3) {
+            if (macros::remove(selectedMacro)) {
+              macros::defaults(selectedMacro,activeMacro);
+              page=Page::MacroList;selection=0;
+            }
+          } else {page=Page::MacroList;selection=0;}
+          break;
+        case Page::MacroEdit:
+          if (selection==activeMacro.stepCount+(activeMacro.stepCount<macros::kMaxSteps?1:0))
+            {page=Page::MacroMenu;selection=0;}
+          else {
+            selectedStep=uint8_t(selection);
+            if (selectedStep<activeMacro.stepCount) {
+              const auto &s=activeMacro.steps[selectedStep];
+              editRemote=s.remote;editButton=s.button;editDelay=0;
+              while (editDelay<4 && kDelays[editDelay]!=s.delayAfterMs) ++editDelay;
+            } else {editRemote=editButton=editDelay=0;}
+            page=Page::MacroStep;selection=0;
+          }
+          break;
+        case Page::MacroStep:
+          if (selection==0) editRemote=(editRemote+1)%store::kRemotes;
+          else if (selection==1) editButton=(editButton+1)%store::kButtons;
+          else if (selection==2) editDelay=(editDelay+1)%5;
+          else if (selection==3) {
+            if (!store::loadSignal(editRemote,editButton,slotScratch)) {
+              Serial.printf("[MACRO] choose an existing Remote %u / Button %u\n",
+                editRemote+1,editButton+1);
+              break;
+            }
+            macros::Macro candidate=activeMacro;
+            candidate.steps[selectedStep]={editRemote,editButton,kDelays[editDelay]};
+            if (selectedStep==candidate.stepCount) ++candidate.stepCount;
+            if (macros::save(selectedMacro,candidate)) {
+              activeMacro=candidate;page=Page::MacroEdit;selection=0;
+            } else Serial.println("[MACRO] step save failed; original retained");
+          } else {
+            if (selectedStep<activeMacro.stepCount) {
+              macros::Macro candidate=activeMacro;
+              for (uint8_t i=selectedStep+1;i<candidate.stepCount;++i)
+                candidate.steps[i-1]=candidate.steps[i];
+              --candidate.stepCount;
+              if (macros::save(selectedMacro,candidate)) activeMacro=candidate;
+              else Serial.println("[MACRO] delete step failed; original retained");
+            }
+            page=Page::MacroEdit;selection=0;
+          }
           break;
         default: break;
       }

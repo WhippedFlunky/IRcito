@@ -25,10 +25,12 @@ struct Signal {
 
 bool begin();
 bool available();
+bool validName(const char *name, size_t capacity = 20);
 bool saveRemote(uint8_t remote, const Remote &record);
 bool loadRemote(uint8_t remote, Remote &record);
 bool saveSignal(uint8_t remote, uint8_t button, const Signal &signal);
 bool loadSignal(uint8_t remote, uint8_t button, Signal &signal);
+bool loadSignalForExport(uint8_t remote, uint8_t button, Signal &signal);
 bool deleteSignal(uint8_t remote, uint8_t button);
 bool eraseAll(); // Only this app's NVS namespace.
 } // namespace store
