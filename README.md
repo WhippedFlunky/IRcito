@@ -2,6 +2,7 @@
 
 **Universal IR learner and remote-control firmware for the M5StickS3.**
 
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![Platform: ESP32-S3](https://img.shields.io/badge/platform-ESP32--S3-informational)
 ![Version: 1.5.0](https://img.shields.io/badge/version-1.5.0-green)
 
@@ -113,11 +114,13 @@ Host-side tests compile on a regular machine with no ESP32:
 g++ -std=c++17 -Wall -Wextra -Werror test/pipeline_host.cpp -o /tmp/pipeline && /tmp/pipeline
 ```
 
+Test targets cover the IR pipeline, storage, macros, backup, hold/repeat and TV-B-Gone. Commands for all of them are in [docs/TECHNICAL.md](docs/TECHNICAL.md#tests).
 
 IRcito v1.5 has also been validated on real M5StickS3 hardware: reception, transmission, learn and replay, persistence across reboots, overwrite and delete, hold/repeat, macros, rename, backup/import and TV-B-Gone. Compatibility with every infrared device or protocol is **not guaranteed**.
 
 ## Documentation
 
+- [docs/TECHNICAL.md](docs/TECHNICAL.md): storage design, replay details, TV-B-Gone, macros, v1.4 compatibility, tests
 - [docs/BACKUP.md](docs/BACKUP.md): backup and import format
 - [RELEASE_NOTES.md](RELEASE_NOTES.md): version history
 
