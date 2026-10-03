@@ -1,719 +1,142 @@
-# IRcito v1.5 — Utilities
+# IRcito
 
-IRcito is an IR learner and remote-control firmware for the **M5StickS3**, distributed as an **ESP32-S3 application image**.
+**Universal IR learner and remote-control firmware for the M5StickS3.**
 
-The provided application binary can be installed using EasyLauncher or any other compatible ESP32-S3 launcher/flashing workflow capable of writing an application image to the correct application partition or offset.
+![Platform: ESP32-S3](https://img.shields.io/badge/platform-ESP32--S3-informational)
+![Version: 1.5.0](https://img.shields.io/badge/version-1.5.0-green)
 
-IRcito uses GPIO42 for IR RX, GPIO46 for IR TX and the ESP32-S3 RMT peripheral at 1 MHz. The current build targets the M5StickS3 with 8 MB flash / OPI PSRAM.
+Point a remote at your M5StickS3, press a button, and IRcito learns it. Save the signal, replay it later, chain several signals into a macro, or fire off TV-B-Gone. Everything is stored on the device itself, with no filesystem and no companion app.
 
-The 256-symbol RX buffer, 12 ms frame gap, EXT_5V handling, speaker amplifier handling, IR normalization/deglitch pipeline, protocol decoders and waveform timing remain unchanged from the physically proven v1.4 build.
-
-`src/ir_pipeline.h` is byte-for-byte unchanged from v1.4.
-
-Small RMT and storage buffers use internal RAM; critical IR functionality does not depend on PSRAM.
+<!-- Add a photo or screenshot of the device here, e.g. ![IRcito on the M5StickS3](docs/images/ircito.jpg) -->
 
 ## Features
 
-IRcito v1.5 includes:
-
-- IR learning using the M5StickS3 built-in receiver
-- Sony SIRC12 decoding and canonical replay
-- NEC / NEC-like decoding and replay
-- RAW fallback for unknown signals
-- Manual RAW carrier selection:
-  - 36 kHz
-  - 38 kHz
-  - 40 kHz
-- Persistent saved remotes and buttons
-- Save, load, overwrite and delete
-- Protocol-aware hold/repeat
-- Rename remotes, buttons and macros
-- Macros / multi-step IR sequences
-- USB Serial backup and import
-- TV-B-Gone
-- North America and Europe TV-B-Gone databases
-- Transactional NVS storage
-- Cross-version compatibility with v1.4 saved signals
-- No filesystem required
-
-## Controls
-
-Home:
-
-- **B** advances through:
-  - Learn
-  - Remotes
-  - Macros
-  - TV-B-Gone
-  - Settings
-  - About
-- **A** opens the selected item
-
-### Learn
-
-After learning a signal:
-
-- **Short A** → Test
-- **Hold A ~800 ms** → Save / Remote
-- **Short B**
-  - RAW signal → change carrier between 36 / 38 / 40 kHz
-  - recognized protocol → capture again
-- **Hold B**
-  - RAW signal → capture again
-  - recognized protocol → return Home
-
-The available controls are also shown on screen.
-
-### Saved remotes
-
-IRcito currently supports:
-
-- **4 remotes**
-- **4 buttons per remote**
-- **16 saved signal slots total**
-
-When saving:
-
-1. Choose Remote 1–4.
-2. Choose Button 1–4.
-3. If the slot already contains a signal, IRcito displays:
-
-```text
-Overwrite?
-Yes / No
-```
-
-The default is **No**.
-
-Saved buttons provide:
-
-- Test
-- Rename
-- Delete
-- Back
-
-### Hold / repeat
-
-On a saved button:
-
-- **Short A** sends the normal command.
-- **Hold A** uses protocol-aware repetition while the button remains pressed.
-
-Sony SIRC12 uses repeated canonical frames at approximately **45 ms start-to-start**.
-
-NEC uses the standard repeat frame:
-
-- 9 ms mark
-- 2.25 ms space
-- 560 µs mark
-
-at approximately **110 ms intervals**.
-
-RAW signals repeat only when they contain a valid repeat policy.
-
-Old v1.4 RAW records with:
-
-```text
-repeatCount = 1
-repeatPeriodUs = 0
-```
-
-do not loop automatically.
-
-Releasing A stops further transmissions.
-
-## Storage and replay
-
-`src/storage.{h,cpp}` uses only the NVS namespace:
-
-```text
-ircito
-```
-
-through ESP32 Preferences.
-
-The application image itself does **not** install, replace or modify a partition table or filesystem.
-
-The build configuration declares a shared NVS partition of:
-
-```text
-0x5000 = 20 KiB
-```
-
-but the actual partition layout, NVS size and application offset depend on the firmware/launcher configuration already installed on the device.
-
-At boot, IRcito checks that the running system contains a partition labelled:
-
-```text
-nvs
-```
-
-and reports its size and available NVS entries over Serial.
-
-If suitable NVS storage is unavailable, saving is disabled gracefully.
-
-If NVS becomes full, the previous stored signal remains active and an error is logged.
-
-### RAW storage
-
-IRcito currently uses a conservative:
-
-```text
-4096-byte total RAW payload budget
-```
-
-across all saved slots.
-
-The unchanged 256-symbol RX buffer accepts up to 255 symbols per frame, approximately:
-
-```text
-1020 bytes
-```
-
-of RAW symbol data for a near-maximal capture.
-
-For comparison:
-
-```text
-16 captures × 59 symbols ≈ 3776 RAW bytes
-```
-
-Recognized signals store compact canonical metadata and also retain their original RAW capture as a backup when space permits.
-
-If the RAW payload budget would be exceeded, the optional RAW backup of a recognized signal may be omitted while preserving the canonical decoded signal.
-
-### Transactional storage
-
-Saved signal records include:
-
-- magic
-- format version
-- length
-- CRC32
-- protocol
-- carrier
-- command/address information
-- repeat metadata
-- bounded RAW count
-
-Each signal slot uses two alternating blobs plus an index.
-
-The write process is:
-
-```text
-write inactive blob
-        ↓
-read back
-        ↓
-validate CRC/data
-        ↓
-commit new index
-        ↓
-delete old blob
-```
-
-A failed overwrite therefore leaves the previous active signal intact.
-
-After an unexpected power loss, an unreferenced blob may remain, but it can be replaced by a future save to the same slot.
-
-Delete removes only the selected slot.
-
-**Erase all learned** clears only IRcito's own NVS namespace and does not erase unrelated ESP32 NVS data.
-
-## IR replay
-
-`src/main.cpp` uses one common `replay()` path for both:
-
-- freshly captured signals
-- loaded saved buttons
-
-### Sony SIRC12
-
-Sony SIRC12 is regenerated canonically using:
-
-- 40 kHz carrier
-- 33% duty
-- three transmissions
-- approximately 45 ms start-to-start
-
-### NEC
-
-Standard NEC replay uses:
-
-```text
-38 kHz
-```
-
-with protocol-aware hold/repeat support.
-
-### RAW
-
-Unknown signals use the preserved original RAW durations.
-
-Because the built-in demodulating IR receiver is active-low while the transmitter uses active-high carrier gating, RAW replay uses the established RX → TX level inversion.
-
-Available carriers:
-
-```text
-36 kHz
-38 kHz
-40 kHz
-```
-
-The original RX capture is never destructively normalized in place.
-
-## TV-B-Gone
-
-IRcito includes TV-B-Gone functionality based on the attributed open-source dataset stored at:
-
-```text
-third_party/tvbgone/WORLD_IR_CODES.h
-```
-
-The generated firmware representation is:
-
-```text
-src/tvbgone_data.cpp
-```
-
-and can be regenerated using:
-
-```text
-tools/generate_tvbgone.py
-```
-
-Licensing and attribution information is available at:
-
-```text
-third_party/tvbgone/NOTICE.md
-```
-
-The TV-B-Gone dataset is licensed under **CC BY-SA 2.5** and is not covered by IRcito's MIT license.
-
-The current database contains:
-
-- 137 North America entries
-- 137 Europe entries
-
-including shared entries.
-
-The encoder decompresses the original MSB-first timing indices in 10 µs units into RMT symbols.
-
-Durations exceeding the RMT 15-bit duration limit are split into multiple symbols without changing their total timing.
-
-TV-B-Gone reuses IRcito's existing:
-
-- RMT TX channel
-- GPIO46
-- EXT_5V handling
-
-and dynamically changes the carrier using:
-
-```cpp
-rmt_apply_carrier()
-```
-
-Four unmodulated database entries are transmitted with carrier disabled.
-
-Codes are sent one at a time with the original approximately **205 ms inter-code gap**.
-
-**B** cancels the sequence between codes.
-
-The longest individual code in the included database lasts approximately **334 ms**.
-
-TV-B-Gone data is stored in firmware flash and is never written to NVS.
-
-## Names
-
-IRcito v1.5 includes a simple two-button text editor.
-
-Available characters:
-
-```text
-A-Z
-a-z
-0-9
-space
--
-_
-+
-```
-
-Controls:
-
-- **Short B** → cycle character
-- **Short A** → append selected character
-- **Hold A** → save
-- **Hold B** → cancel
-
-Names are limited to:
-
-```text
-19 characters + NUL
-```
-
-Remote, signal and macro names can also be modified through the backup/import workflow.
-
-## Macros
-
-IRcito supports:
-
-```text
-4 macros
-```
-
-with up to:
-
-```text
-8 steps per macro
-```
-
-Each macro step references an existing:
-
-```text
-Remote / Button
-```
-
-rather than duplicating the stored IR signal.
-
-Available delays between steps:
-
-```text
-0 ms
-250 ms
-500 ms
-1000 ms
-2000 ms
-```
-
-Macro execution loads each referenced signal and calls the same `replay()` function used elsewhere in IRcito.
-
-**B** can cancel a macro between steps.
-
-If a referenced button no longer exists, execution stops and logs:
-
-```text
-[MACRO] missing
-```
-
-Macros are stored separately using keys such as:
-
-```text
-m0a
-m0b
-m0i
-...
-m3a
-m3b
-m3i
-```
-
-inside the same IRcito-owned NVS namespace.
-
-Macro records include:
-
-- format version
-- CRC
-- A/B transactional commit
-
-Macro data does not count against the 4096-byte RAW payload budget.
-
-## v1.4 compatibility
-
-IRcito v1.5 maintains compatibility with the v1.4 signal and remote storage format.
-
-Remote names continue using:
-
-```text
-r0
-r1
-r2
-r3
-```
-
-Signal records continue using the original v1.4 layout such as:
-
-```text
-s00a
-s00b
-```
-
-and the existing A/B index mechanism.
-
-Existing v1.4 Sony, NEC and RAW signals can be loaded by v1.5 without migration.
-
-Neither existing saved signals nor the device's existing partition table are migrated or erased when upgrading.
-
-`src/ir_pipeline.h` remains byte-for-byte identical to v1.4.
-
-SHA-256:
-
-```text
-65a97ce85edb568bd26d30c7f1588d2e6fe680b02e11b6cb3991d0addae47770
-```
-
-## USB backup and import
-
-Settings → **Export Backup** writes a complete versioned backup to USB Serial at:
-
-```text
-115200 baud
-```
-
-The export is delimited by:
-
-```text
-[EXPORT] BEGIN
-...
-[EXPORT] END
-```
-
-The actual backup data begins with:
-
-```text
-IRCITO-BACKUP|1
-```
-
-and ends with:
-
-```text
-END
-```
-
-Copy those lines into a text file to keep a backup.
-
-Settings → **Import Backup** accepts the same format pasted over USB Serial.
-
-Import is designed as a safe merge/overwrite operation.
-
-It does **not** call:
-
-```cpp
-eraseAll()
-```
-
-before restoring data.
-
-Each complete and valid record commits independently to its target NVS slot.
-
-If an import stream is truncated, records that were never reached remain unchanged.
-
-Invalid records are rejected rather than blindly written.
-
-Full documentation:
-
-[docs/BACKUP.md](docs/BACKUP.md)
-
-## Build
-
-IRcito uses PlatformIO and Arduino-ESP32 3.3.6.
-
-Build with:
-
-```sh
-pio run -e m5stack-sticks3
-```
-
-or:
-
-```sh
-python -m platformio run -e m5stack-sticks3
-```
-
-The application binary is generated at:
-
-```text
-.pio/build/m5stack-sticks3/firmware.bin
-```
+- **Learn** signals with the built-in IR receiver
+- **Sony SIRC12** and **NEC / NEC-like** decoding with canonical replay
+- **RAW fallback** for unknown protocols, with selectable 36 / 38 / 40 kHz carrier
+- **Saved remotes:** 4 remotes × 4 buttons, persistent across reboots
+- **Hold to repeat**, protocol-aware (Sony, NEC and RAW with a repeat policy)
+- **Macros:** up to 4 macros of 8 steps each, with configurable delays
+- **Rename** remotes, buttons and macros on-device
+- **TV-B-Gone** with North America and Europe databases
+- **USB Serial backup and import**
+- **Crash-safe storage:** a failed save never destroys the previous signal
+- Compatible with signals saved by v1.4
+
+## Hardware
+
+| Item | Value |
+|---|---|
+| Device | M5StickS3 (ESP32-S3, 8 MB flash, OPI PSRAM) |
+| IR receiver | GPIO42 |
+| IR transmitter | GPIO46 |
+| Framework | Arduino-ESP32 3.3.6 via PlatformIO |
 
 ## Installation
 
-The generated/downloadable `.bin` is an **ESP32-S3 application image**.
+The release file `IRcito-v1.5.bin` is an **ESP32-S3 application image**. Install it with [EasyLauncher](https://github.com/) or any other launcher or flashing workflow that can write an application image to the correct application partition.
 
-It can be installed using EasyLauncher or any other compatible ESP32-S3 launcher/flashing workflow that supports writing an application image to the correct application partition or offset.
+> [!WARNING]
+> The `.bin` is **not** a merged full-flash image. It contains no bootloader and no partition table. **Do not write it to `0x0`.** If you use a low-level tool such as `esptool`, first read the application partition offset from the partition table already on your device.
 
-Examples include launcher-based installation and correctly configured low-level flashing workflows.
+IRcito does not install or modify the partition table. It uses a partition labelled `nvs` that must already exist on the device. If none is available, saving is disabled and everything else keeps working.
 
-> **Important:** IRcito's release `.bin` is **not a merged full-flash image**.
+### Build from source
 
-It does not contain the complete:
-
-- bootloader
-- partition table
-- full device flash layout
-
-Therefore, do **not** blindly write the application binary to:
-
-```text
-0x0
+```bash
+pio run -e m5stack-sticks3
 ```
 
-When using a low-level flashing tool such as `esptool`, determine the correct application partition offset from the partition table already installed on the device before writing IRcito.
+The image is written to `.pio/build/m5stack-sticks3/firmware.bin`.
 
-The application binary itself does not replace the existing partition table.
+## Usage
 
-USB Serial:
+Press **B** on the home screen to move through the menu and **A** to open the selected item.
 
-```text
-115200 baud
-```
+**Home menu:** Learn → Remotes → Macros → TV-B-Gone → Settings → About
 
-## Tests
+### Learning a signal
 
-Host-side checks can be compiled without an ESP32.
+| After capture | Action |
+|---|---|
+| Short **A** | Test the signal |
+| Hold **A** (~800 ms) | Save to a remote and button |
+| Short **B** | RAW: change carrier (36 / 38 / 40 kHz). Recognized: capture again |
+| Hold **B** | RAW: capture again. Recognized: back to Home |
 
-### IR pipeline
+On-screen hints show the available actions.
 
-```sh
-g++ -std=c++17 -Wall -Wextra -Werror \
-  test/pipeline_host.cpp \
-  -o /tmp/pipeline && /tmp/pipeline
-```
+### Saved remotes and buttons
 
-### Storage
+Choose a remote (1–4) and a button (1–4) when saving. If the slot is taken, IRcito asks for confirmation and defaults to **No**.
 
-```sh
-g++ -std=c++17 -Wall -Wextra -Werror \
-  -Itest/stubs \
-  test/storage_host.cpp src/storage.cpp \
-  -o /tmp/storage && /tmp/storage
-```
+On a saved button:
 
-### TV-B-Gone
-
-```sh
-g++ -std=c++17 -Wall -Wextra -Werror \
-  -Itest/stubs \
-  test/tvbgone_host.cpp src/tvbgone.cpp src/tvbgone_data.cpp \
-  -o /tmp/tvbgone && /tmp/tvbgone
-```
+- **Short A** sends the command once.
+- **Hold A** repeats it while the button stays pressed.
+- The menu also offers **Rename** and **Delete**.
 
 ### Macros
 
-```sh
-g++ -std=c++17 -Wall -Wextra -Werror \
-  -Itest/stubs \
-  test/macro_host.cpp src/macros.cpp src/storage.cpp \
-  -o /tmp/macro && /tmp/macro
+A macro is a sequence of up to 8 steps. Each step points to an existing remote button and adds a delay of 0, 250, 500, 1000 or 2000 ms before the next step. Press **B** to cancel between steps. If a referenced button has been deleted, the macro stops.
+
+### TV-B-Gone
+
+Sends power-off codes one at a time from the North America or Europe database. Press **B** to cancel between codes.
+
+### Naming
+
+A two-button editor: short **B** cycles the character, short **A** appends it, hold **A** saves, hold **B** cancels. Names are up to 19 characters from `A-Z a-z 0-9 space - _ +`.
+
+### Backup and import
+
+Settings → **Export Backup** prints a versioned backup over USB Serial (115200 baud). Copy the output into a text file to keep it. Settings → **Import Backup** accepts the same text pasted back in. Import merges into existing data and never wipes it first. See [docs/BACKUP.md](docs/BACKUP.md) for the format.
+
+## Limits
+
+| Resource | Limit |
+|---|---|
+| Remotes | 4 |
+| Buttons per remote | 4 (16 signal slots total) |
+| Macros | 4, with up to 8 steps each |
+| Name length | 19 characters |
+| RAW payload, all slots combined | 4096 bytes |
+| RAW symbols per captured frame | 255 |
+
+If the RAW budget would be exceeded, the optional RAW backup of a recognized signal is dropped and the decoded signal is kept.
+
+## Tests
+
+Host-side tests compile on a regular machine with no ESP32:
+
+```bash
+g++ -std=c++17 -Wall -Wextra -Werror test/pipeline_host.cpp -o /tmp/pipeline && /tmp/pipeline
 ```
 
-### Backup
 
-```sh
-g++ -std=c++17 -Wall -Wextra -Werror \
-  -Itest/stubs \
-  test/backup_host.cpp src/backup.cpp src/macros.cpp src/storage.cpp \
-  -o /tmp/backup && /tmp/backup
-```
+IRcito v1.5 has also been validated on real M5StickS3 hardware: reception, transmission, learn and replay, persistence across reboots, overwrite and delete, hold/repeat, macros, rename, backup/import and TV-B-Gone. Compatibility with every infrared device or protocol is **not guaranteed**.
 
-### Hold/repeat
+## Documentation
 
-```sh
-g++ -std=c++17 -Wall -Wextra -Werror \
-  -Itest/stubs \
-  test/hold_host.cpp \
-  -o /tmp/hold && /tmp/hold
-```
-
-The host checks cover:
-
-- Sony and NEC decoding
-- IR pipeline regression
-- transactional storage
-- simulated storage failures
-- corruption handling
-- namespace isolation
-- TV-B-Gone database decoding
-- macros
-- backup/import
-- hold/repeat
-- v1.4 → v1.5 NVS compatibility
-
-PlatformIO build:
-
-```text
-pio run -e m5stack-sticks3
-PASS
-```
-
-## Physical testing
-
-IRcito v1.5 has been physically validated on real M5StickS3 hardware.
-
-Tested functionality includes:
-
-- IR reception
-- IR transmission
-- Learn / replay
-- persistence across reboot
-- saved remotes
-- Sony SIRC12
-- NEC / NEC-like signals
-- RAW fallback
-- RAW carrier switching
-- overwrite / delete
-- hold/repeat
-- macros
-- rename
-- USB backup/import
-- TV-B-Gone
-
-Compatibility with every infrared device or protocol is **not guaranteed**.
+- [docs/BACKUP.md](docs/BACKUP.md): backup and import format
+- [RELEASE_NOTES.md](RELEASE_NOTES.md): version history
 
 ## Binary release
 
-IRcito v1.5.0:
-
-```text
-IRcito-v1.5.bin
-```
-
-Size:
-
-```text
-666608 bytes
-```
-
-SHA-256:
-
-```text
-6e0f4ff58be59fcff8e3a822eeeb45ed9a243f4415db0b96665adcc5cffb74ae
-```
-
-The provided file is a valid ESP32-S3 **application image**, not a merged full-flash image.
+| | |
+|---|---|
+| File | `IRcito-v1.5.bin` |
+| Size | 666608 bytes |
+| SHA-256 | `6e0f4ff58be59fcff8e3a822eeeb45ed9a243f4415db0b96665adcc5cffb74ae` |
 
 ## Development
 
-IRcito is an **AI-assisted firmware project**.
+IRcito is an **AI-assisted firmware project**. Project direction, requirements, hardware testing, debugging, integration and physical validation were carried out by **Nara Sofía García Ramírez**. Code implementation and review were assisted by **OpenAI ChatGPT Work**.
 
-Project direction, requirements, hardware testing, debugging, integration and physical validation were carried out by **Nara Sofía García Ramírez**.
-
-Code implementation and review were assisted by **OpenAI ChatGPT Work**.
-
-The project was developed iteratively using:
-
-- real IR captures
-- serial logs
-- physical hardware testing
-- regression testing
-- protocol analysis
+It was built iteratively from real IR captures, serial logs, physical hardware testing, regression tests and protocol analysis.
 
 ## License
 
-Original IRcito source code is released under the **MIT License**.
+Original IRcito source code is released under the [MIT License](LICENSE).
 
-See:
-
-```text
-LICENSE
-```
-
-Third-party components and datasets retain their respective licenses and attribution requirements.
-
-In particular, the TV-B-Gone dataset is **not** covered by IRcito's MIT license.
-
-See:
-
-```text
-third_party/tvbgone/NOTICE.md
-```
+Third-party components and datasets keep their own licenses. In particular, the TV-B-Gone dataset is licensed under **CC BY-SA 2.5** and is **not** covered by IRcito's MIT license. See [third_party/tvbgone/NOTICE.md](third_party/tvbgone/NOTICE.md).
